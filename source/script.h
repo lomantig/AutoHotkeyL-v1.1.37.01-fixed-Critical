@@ -180,7 +180,7 @@ enum CommandIDs {CONTROL_ID_FIRST = IDCANCEL + 1
 #define ERR_TOO_MANY_PARAMS _T("Too many parameters passed to function.") // L31
 #define ERR_TOO_FEW_PARAMS _T("Too few parameters passed to function.") // L31
 #define ERR_BAD_OPTIONAL_PARAM _T("Expected \":=\"")
-#define ERR_HOTKEY_FUNC_PARAMS _T("Only the first parameter of a hotkey function is permitted to be non-optional.")
+#define ERR_HOTKEY_FUNC_PARAMS _T("A hotkey function must not require more or less than 1 parameter.")
 #define ERR_HOTKEY_MISSING_BRACE _T("Hotkey or hotstring is missing its opening brace.")
 #define ERR_ELSE_WITH_NO_IF _T("ELSE with no matching IF")
 #define ERR_UNTIL_WITH_NO_LOOP _T("UNTIL with no matching LOOP")
@@ -189,8 +189,6 @@ enum CommandIDs {CONTROL_ID_FIRST = IDCANCEL + 1
 #define ERR_BAD_JUMP_INSIDE_FINALLY _T("Jumps cannot exit a FINALLY block.")
 #define ERR_UNEXPECTED_CASE _T("Case/Default must be enclosed by a Switch.")
 #define ERR_TOO_MANY_CASE_VALUES _T("Too many case values.")
-#define ERR_EXPECTED_BLOCK_OR_ACTION _T("Expected \"{\" or single-line action.")
-#define ERR_EXPECTED_ACTION _T("Expected single-line action.")
 #define ERR_OUTOFMEM _T("Out of memory.")  // Used by RegEx too, so don't change it without also changing RegEx to keep the former string.
 #define ERR_EXPR_TOO_LONG _T("Expression too complex")
 #define ERR_TOO_MANY_REFS ERR_EXPR_TOO_LONG // No longer applies to just var/func refs. Old message: "Too many var/func refs."
@@ -417,6 +415,14 @@ struct ArgStruct
 	DerefType *deref;  // Will hold a NULL-terminated array of operands/word-operators pre-parsed by ParseDerefs()/ParseOperands().
 	ExprTokenType *postfix;  // An array of tokens in postfix order.
 	int max_stack, max_alloc;
+};
+
+enum FuncDefType : UCHAR
+{
+	FuncDefNormal = FALSE,
+	FuncDefFatArrow,
+	FuncDefExpression,
+	FuncDefExpressionResolved
 };
 
 __int64 pow_ll(__int64 base, __int64 exp); // integer power function
@@ -1377,13 +1383,13 @@ public:
 
 
 
-enum FuncParamDefaults {PARAM_DEFAULT_NONE, PARAM_DEFAULT_STR, PARAM_DEFAULT_INT, PARAM_DEFAULT_FLOAT, PARAM_DEFAULT_UNSET};
+enum FuncParamDefaults {PARAM_DEFAULT_NONE, PARAM_DEFAULT_STR, PARAM_DEFAULT_INT, PARAM_DEFAULT_FLOAT, PARAM_DEFAULT_UNSET, PARAM_DEFAULT_EXPR};
 struct FuncParam
 {
 	Var *var;
 	WORD is_byref; // Boolean, but defined as WORD in case it helps data alignment and/or performance (BOOL vs. WORD didn't help benchmarks).
 	WORD default_type;
-	union {LPTSTR default_str; __int64 default_int64; double default_double;};
+	union {LPTSTR default_str; __int64 default_int64; double default_double; Line *default_expr;};
 };
 
 struct FuncResult : public ResultToken
@@ -1411,7 +1417,7 @@ struct ScriptItemList
 };
 
 class Func;
-typedef ScriptItemList<Func, 4> FuncList; // Initial count is small since functions aren't expected to contain many nested functions.
+typedef ScriptItemList<UserFunc, 4> FuncList; // Initial count is small since functions aren't expected to contain many nested functions.
 typedef ScriptItemList<Var, VARLIST_INITIAL_SIZE> VarList;
 
 
@@ -1559,7 +1565,7 @@ public:
 	int mClosureCount = 0;
 
 	// Keep small members adjacent to each other to save space and improve perf. due to byte alignment:
-	bool mIsFuncExpression; // Whether this function was defined *within* an expression and is therefore allowed under a control flow statement.
+	FuncDefType mIsFuncExpression; // Whether this function was defined *within* an expression and is therefore allowed under a control flow statement.
 	bool mIsStatic = false; // Whether the "static" keyword was used with a function (not method); this prevents a nested function from becoming a closure.
 #define VAR_DECLARE_GLOBAL (VAR_DECLARED | VAR_GLOBAL)
 #define VAR_DECLARE_LOCAL  (VAR_DECLARED | VAR_LOCAL)
@@ -1600,8 +1606,6 @@ public:
 		// outermost function call of a line consisting only of function calls, namely ACT_EXPRESSION)
 		// would not be significant because the Return command's expression (arg1) must still be evaluated
 		// in case it calls any functions that have side-effects, e.g. "return LogThisError()".
-		auto prev_func = g->CurrentFunc; // This will be non-NULL when a function is called from inside another function.
-		g->CurrentFunc = this;
 		// Although a GOTO that jumps to a position outside of the function's body could be supported,
 		// it seems best not to for these reasons:
 		// 1) The extreme rarity of a legitimate desire to intentionally do so.
@@ -1648,10 +1652,6 @@ public:
 			result = OK; // Function results should be OK, FAIL or EARLY_EXIT.
 		}
 
-		// Restore the original value in case this function is called from inside another function.
-		// Due to the synchronous nature of recursion and recursion-collapse, this should keep
-		// g->CurrentFunc accurate, even amidst the asynchronous saving and restoring of "g" itself:
-		g->CurrentFunc = prev_func;
 		return result;
 	}
 
@@ -1950,6 +1950,7 @@ public:
 	MsgMonitorStruct& operator[] (const int aIndex) { return mMonitor[aIndex]; }
 	int Count() { return mCount; }
 	BOOL IsMonitoring(UINT aMsg, UCHAR aMsgType = 0);
+	BOOL IsMonitoringGuiMsg();
 	BOOL IsRunning(UINT aMsg, UCHAR aMsgType = 0);
 
 	MsgMonitorList() : mCount(0), mCountMax(0), mMonitor(NULL), mTop(NULL) {}
@@ -2039,8 +2040,8 @@ public:
 	FResult SetColor(ExprTokenType *aColor, optl<BOOL> aApplyToSubmenus);
 	FResult SetIcon(StrArg aItemName, StrArg aIconFile, optl<int> aIconNumber, optl<int> aIconWidth);
 	FResult Show(optl<int> aX, optl<int> aY, optl<BOOL> aWait);
-	FResult ToggleCheck(StrArg aItemName);
-	FResult ToggleEnable(StrArg aItemName);
+	FResult ToggleCheck(StrArg aItemName, BOOL &aRetVal);
+	FResult ToggleEnable(StrArg aItemName, BOOL &aRetVal);
 	FResult Uncheck(StrArg aItemName);
 	
 	FResult get_ClickCount(int &aRetVal);
@@ -2058,7 +2059,7 @@ public:
 	ResultType RenameItem(UserMenuItem *aMenuItem, LPCTSTR aNewName);
 	ResultType UpdateName(UserMenuItem *aMenuItem, LPCTSTR aNewName);
 	void SetItemState(UserMenuItem *aMenuItem, UINT aState, UINT aStateMask);
-	FResult SetItemState(StrArg aItemName, UINT aState, UINT aStateMask);
+	FResult SetItemState(StrArg aItemName, UINT aState, UINT aStateMask, UINT *aNewState = nullptr);
 	void SetDefault(UserMenuItem *aMenuItem = NULL, bool aUpdateGuiMenuBars = true);
 	ResultType CreateHandle();
 	void DestroyHandle();
@@ -2292,9 +2293,11 @@ struct GuiControlType : public Object
 	static ObjectMemberMd sMembersList[]; // Tab, ListBox, ComboBox, DDL
 	static ObjectMemberMd sMembersTab[];
 	static ObjectMemberMd sMembersDate[];
+	static ObjectMemberMd sMembersEdit[];
 	static ObjectMemberMd sMembersLV[];
 	static ObjectMemberMd sMembersTV[];
 	static ObjectMemberMd sMembersSB[];
+	static ObjectMemberMd sMembersCB[];
 
 	static Object *sPrototype, *sPrototypeList;
 	static Object *sPrototypes[GUI_CONTROL_TYPE_COUNT];
@@ -2306,6 +2309,7 @@ struct GuiControlType : public Object
 	FResult Move(optl<int> aX, optl<int> aY, optl<int> aWidth, optl<int> aHeight);
 	FResult OnCommand(int aNotifyCode, ExprTokenType &aCallback, optl<int> aAddRemove);
 	FResult OnEvent(StrArg aEventName, ExprTokenType &aCallback, optl<int> aAddRemove);
+	FResult OnMessage(UINT aNumber, ExprTokenType &aCallback, optl<int> aAddRemove);
 	FResult OnNotify(int aNotifyCode, ExprTokenType &aCallback, optl<int> aAddRemove);
 	FResult Opt(StrArg aOptions);
 	FResult Redraw();
@@ -2328,6 +2332,8 @@ struct GuiControlType : public Object
 	FResult set_Visible(BOOL aValue);
 	
 	FResult DT_SetFormat(optl<StrArg> aFormat);
+
+	FResult Edit_SetCue(StrArg aCueText, optl<BOOL> aActivate);
 	
 	FResult List_Add(ExprTokenType &aItems);
 	FResult List_Choose(ExprTokenType &aValue);
@@ -2353,6 +2359,8 @@ struct GuiControlType : public Object
 	FResult SB_SetParts(VariantParams &aParam, UINT& aRetVal);
 	FResult SB_SetText(StrArg aNewText, optl<UINT> aPartNumber, optl<UINT> aStyle);
 	
+	FResult CB_SetCue(StrArg aCueText);
+
 	FResult Tab_UseTab(ExprTokenType *aTab, optl<BOOL> aExact);
 	
 	FResult TV_AddModify(bool aAdd, UINT_PTR aItemID, UINT_PTR aParentItemID, optl<StrArg> aOptions, optl<StrArg> aName, UINT_PTR &aRetVal);
@@ -2414,6 +2422,7 @@ struct GuiControlOptionsType
 
 LRESULT CALLBACK GuiWindowProc(HWND hWnd, UINT iMsg, WPARAM wParam, LPARAM lParam);
 LRESULT CALLBACK TabWindowProc(HWND hWnd, UINT iMsg, WPARAM wParam, LPARAM lParam);
+LRESULT CALLBACK ControlWindowProc(HWND hWnd, UINT iMsg, WPARAM wParam, LPARAM lParam, UINT_PTR uIdSubclass, DWORD_PTR dwRefData);
 
 class GuiType : public Object
 {
@@ -2611,6 +2620,7 @@ public:
 	FResult OnEvent(GuiControlType *aControl, UINT aEvent, UCHAR aEventKind, ExprTokenType &aCallback, optl<int> aAddRemove);
 	FResult OnEvent(GuiControlType *aControl, UINT aEvent, UCHAR aEventKind, IObject *aFunc, LPTSTR aMethodName, int aMaxThreads);
 	void ApplyEventStyles(GuiControlType *aControl, UINT aEvent, bool aAdded);
+	void ApplySubclassing(GuiControlType *aControl);
 	static LPTSTR sEventNames[];
 	static LPTSTR ConvertEvent(GuiEventType evt);
 	static GuiEventType ConvertEvent(LPCTSTR evt);
@@ -2680,6 +2690,7 @@ public:
 
 	void Event(GuiIndexType aControlIndex, UINT aNotifyCode, USHORT aGuiEvent = GUI_EVENT_NONE, UINT_PTR aEventInfo = 0);
 	bool ControlWmNotify(GuiControlType &aControl, LPNMHDR aNmHdr, INT_PTR &aRetVal);
+	bool MsgMonitor(GuiControlType *aControl, UINT aMsg, WPARAM awParam, LPARAM alParam, MSG *apMsg, INT_PTR *aRetVal);
 
 	static WORD TextToHotkey(LPCTSTR aText);
 	static LPTSTR HotkeyToText(WORD aHotkey, LPTSTR aBuf);
@@ -2801,18 +2812,24 @@ private:
 	struct PartialExpression
 	{
 		PartialExpression *outer;
-		Line *pending_parent;
 		UserFunc *func = nullptr;
 		LPTSTR code;
 		size_t length;
+		Line *rejoin_first_line = nullptr, *rejoin_last_line = nullptr;
+		LPCTSTR pending_hotkey = nullptr;
+		int funcs_index;
 		LineNumberType line_no;
-		PartialExpression(LPTSTR aCode, size_t aLen, Script &aScript)
-			: code(aCode), length(aLen)
+		ActionTypeType action;
+		bool add_block_end_after = false;
+		PartialExpression(LPTSTR aCode, size_t aLen, ActionTypeType aAct, Script &aScript)
+			: code(aCode), length(aLen), action(aAct)
 			, outer(aScript.mExprContainingThisFunc)
-			, pending_parent(aScript.mPendingParentLine)
+			, funcs_index(aScript.mFuncs.mCount + 1) // +1 to exclude func itself.
 			, line_no(aScript.mCombinedLineNumber) {}
 		~PartialExpression() { free(code); }
 	};
+#define FDE_SUBSTITUTE_STRING L"(\u2026){}"
+#define FDE_SUBSTITUTE_STRING_LENGTH (_countof(FDE_SUBSTITUTE_STRING)-1)
 
 	Line *mFirstLine, *mLastLine;     // The first and last lines in the linked list.
 	Label *mFirstLabel, *mLastLabel;  // The first and last labels in the linked list.
@@ -2821,25 +2838,16 @@ private:
 #endif
 	FuncList mFuncs;
 	
-	UserFunc *mLastHotFunc;		// For hotkey/hotstring functions
-	UserFunc *mUnusedHotFunc;	// If defining a named function under a "trigger::" the implicit
-								// function stored in mLastHotFunc will not be used, store it in this
-								// variable for reuse.
-	FuncList mHotFuncs;			// All implicit hotkey funcs, stored for some delayed processing.
-								// This list is not sorted, all insertions are done at the end.
-								// In particular, note that DefineFunc and CreateHotFunc directly
-								// change mCount. This list's member mItem is freed after being
-								// passed to PreprocessLocalVars. Do not use this list after that. 
-
 	VarList mVars; // Sorted list of global variables.
 	WinGroup *mFirstGroup, *mLastGroup;  // The first and last variables in the linked list.
-	Line *mOpenBlock; // While loading the script, this is the beginning of a block which is currently open.
-	Line *mPendingParentLine, *mPendingRelatedLine;
+	Line *mLineParent = nullptr; // While loading the script, the parent line or block-begin for the next line to be added.
+	Line *mPendingRelatedLine;
 	Line *mLastParamInitializer;
+	LPCTSTR mPendingHotkey = nullptr; // The name of a hotkey or hotstring awaiting its block/function.
 	PartialExpression *mExprContainingThisFunc = nullptr;
+	int mExprFuncIndex = INT_MAX;
 	SymbolType mDefaultReturn = SYM_STRING;
 	bool mNextLineIsFunctionBody; // Whether the very next line to be added will be the first one of the body.
-	bool mNoUpdateLabels;
 	bool mIgnoreNextBlockBegin;
 
 #define MAX_NESTED_CLASSES 5
@@ -2889,17 +2897,16 @@ private:
 	ResultType IsDirective(LPTSTR aBuf);
 	ResultType ConvertDirectiveBool(LPTSTR aBuf, bool &aResult, bool aDefault);
 	ResultType RequirementError(LPCTSTR aRequirement);
-	ResultType ParseAndAddLine(LPTSTR aLineText, ActionTypeType aActionType = ACT_INVALID
-		, LPTSTR aLiteralMap = NULL, size_t aLiteralMapLength = 0);
-	ResultType ParseOperands(LPTSTR aArgText, LPTSTR aArgMap, DerefList &aDeref, int *aPos = NULL, TCHAR aEndChar = 0);
-	ResultType ParseDoubleDeref(LPTSTR aArgText, LPTSTR aArgMap, DerefList &aDeref, int *aPos);
-	ResultType ParseFatArrow(LPTSTR aArgText, LPTSTR aArgMap, DerefList &aDeref
+	ResultType ParseAndAddLine(LPTSTR aLineText, ActionTypeType aActionType = ACT_INVALID);
+	ResultType ParseOperands(LPTSTR aArgText, DerefList &aDeref, int *aPos = NULL, TCHAR aEndChar = 0);
+	ResultType ParseDoubleDeref(LPTSTR aArgText, DerefList &aDeref, int *aPos);
+	ResultType ParseFatArrow(LPTSTR aArgText, DerefList &aDeref
 		, LPTSTR aPrmStart, LPTSTR aPrmEnd, LPTSTR aExpr, LPTSTR &aExprEnd);
-	ResultType ParseFatArrow(DerefList &aDeref, LPTSTR aPrmStart, LPTSTR aPrmEnd, LPTSTR aExpr, LPTSTR aExprEnd, LPTSTR aExprMap);
+	ResultType ParseFatArrow(DerefList &aDeref, LPTSTR aPrmStart, LPTSTR aPrmEnd, LPTSTR aExpr, LPTSTR aExprEnd);
+	ResultType ParseAndAddLineInBlock(LPTSTR aLineText, ActionTypeType aActionType = ACT_INVALID);
 	LPTSTR ParseActionType(LPTSTR aBufTarget, LPTSTR aBufSource);
 	ResultType AddLabel(LPTSTR aLabelName, bool aAllowDupe);
-	void RemoveLabel(Label *aLabel);
-	ResultType AddLine(ActionTypeType aActionType, LPTSTR aArg[] = NULL, int aArgc = 0, LPTSTR aArgMap[] = NULL, bool aAllArgsAreExpressions = false);
+	ResultType AddLine(ActionTypeType aActionType, LPTSTR aArg[] = NULL, int aArgc = 0, bool aAllArgsAreExpressions = false);
 
 	// These aren't in the Line class because I think they're easier to implement
 	// if aStartingLine is allowed to be NULL (for recursive calls).  If they
@@ -2990,6 +2997,7 @@ public:
 	LineNumberType LoadFromFile(LPCTSTR aFileSpec);
 	ResultType LoadIncludedFile(LPCTSTR aFileSpec, bool aAllowDuplicateInclude, bool aIgnoreLoadFailure);
 	ResultType LoadIncludedFile(TextStream *fp, int aFileIndex);
+	ResultType ParseRemap(LPCTSTR aSource, vk_type remap_dest_vk, LPCTSTR aDestName, LPCTSTR aDestMods);
 	ResultType OpenIncludedFile(TextStream *&ts, LPCTSTR aFileSpec, bool aAllowDuplicateInclude, bool aIgnoreLoadFailure);
 	LineNumberType CurrentLine();
 	LPTSTR CurrentFile();
@@ -3007,7 +3015,7 @@ public:
 	void DeleteTimer(IObject *aCallback);
 	LPTSTR DefaultDialogTitle();
 	UserFunc* CreateHotFunc();
-	ResultType DefineFunc(LPTSTR aBuf, bool aStatic = false, bool aIsInExpression = false);
+	ResultType DefineFunc(LPTSTR aBuf, bool aStatic = false, FuncDefType aIsInExpression = FuncDefNormal);
 #ifndef AUTOHOTKEYSC
 	struct FuncLibrary
 	{
@@ -3021,7 +3029,9 @@ public:
 	Func *FindGlobalFunc(LPCTSTR aFuncName, size_t aFuncNameLength = 0);
 	static Func *GetBuiltInFunc(LPTSTR aFuncName);
 	static Func *GetBuiltInMdFunc(LPTSTR aFuncName);
-	UserFunc *AddFunc(LPCTSTR aFuncName, size_t aFuncNameLength, Object *aClassObject = NULL);
+	UserFunc *AddFunc(LPCTSTR aFuncName, size_t aFuncNameLength, FuncDefType aIsInExpression = FuncDefNormal, Object *aClassObject = nullptr);
+	Var *AddFuncVar(UserFunc *aFunc);
+	UserFunc *AddFuncToList(UserFunc *aFunc);
 
 	ResultType DefineClass(LPTSTR aBuf);
 	UserFunc *DefineClassInit(bool aStatic);
@@ -3158,6 +3168,8 @@ BIV_DECL_RW(BIV_SendMode);
 BIV_DECL_RW(BIV_SendLevel);
 BIV_DECL_RW(BIV_StoreCapsLockMode);
 BIV_DECL_RW(BIV_Hotkey);
+BIV_DECL_R (BIV_KeybdHookInstalled);
+BIV_DECL_R (BIV_MouseHookInstalled);
 BIV_DECL_RW(BIV_MenuMaskKey);
 BIV_DECL_R (BIV_IsPaused);
 BIV_DECL_R (BIV_IsCritical);
